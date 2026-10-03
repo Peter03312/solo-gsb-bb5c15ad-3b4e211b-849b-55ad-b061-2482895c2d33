@@ -250,6 +250,27 @@ CREATE TABLE IF NOT EXISTS attendance_gaps (
   UNIQUE (session_id, role_id)
 );
 
+-- 演员不可用时段：演员本人登记的带时区起止时段（服务端归一化为 UTC 存储）。
+--   * 重叠判定为半开区间 [start, end)：端点相接不算重叠；结束必须晚于开始。
+--   * 仅 status=active 的记录参与冲突检测；“撤销”为 cancelled（记录保留可查）。
+--   * 登记/修改时与本人“当前参与的有效（active）排练日程”重叠 -> 整次拒绝；
+--     导演安排/调整时段、派角/改派、显式换版时同样检查受影响演员的 active 记录，
+--     相撞则整次操作不生效（已取消与待调整日程不参与）。
+--   * 不影响已开启到场登记的冻结名单与签到。
+CREATE TABLE IF NOT EXISTS actor_unavailability (
+  id           INTEGER PRIMARY KEY,
+  actor_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  start_at     TEXT NOT NULL,
+  end_at       TEXT NOT NULL,
+  reason       TEXT NOT NULL DEFAULT '',
+  status       TEXT NOT NULL DEFAULT 'active'
+                 CHECK (status IN ('active', 'cancelled')),
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at   TEXT,
+  cancelled_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_unavailability_actor ON actor_unavailability(actor_id, status);
+
 -- 演员按“所派角色 × 场次”确认；content_hash 对应确认时排练固定版本的台词文本。
 -- 唯一键含 actor_id：角色改派后保留原演员的历史确认（不计入），新演员需重新确认。
 CREATE TABLE IF NOT EXISTS confirmations (

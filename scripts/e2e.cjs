@@ -520,6 +520,139 @@ async function main() {
   const linSchedsA = await G(`/api/rehearsals/${rhA}/schedules`, lin);
   check('未开启登记时演员摘要为 null', linSchedsA.schedules.every((s) => s.attendance === null));
 
+  console.log('— 演员不可用时段：登记校验、UTC 归一化、与本人有效日程冲突 —');
+  // 专用排练 RH_U：p3 v1，RX=林晚（RX 在 AT1/AT2 均有台词）
+  const rhU = (await J(`/api/plays/${p3.id}/rehearsals`, director, { versionId: p3v1, name: '不可用排练1' }, 201)).id;
+  await J(`/api/rehearsals/${rhU}/cast`, director, { roleId: roleX, actorId: linId }, 201);
+
+  // 校验：导演不能代登记；无时区 / 结束不晚于开始 / 原因为空均 400
+  await J('/api/unavailability', director, { startAt: '2032-01-01T10:00:00Z', endAt: '2032-01-01T11:00:00Z', reason: 'x' }, 403);
+  await J('/api/unavailability', lin, { startAt: '2032-01-01T10:00', endAt: '2032-01-01T11:00', reason: 'x' }, 400);
+  await J('/api/unavailability', lin, { startAt: '2032-01-01T11:00:00+08:00', endAt: '2032-01-01T10:00:00+08:00', reason: 'x' }, 400);
+  await J('/api/unavailability', lin, { startAt: '2032-01-01T10:00:00+08:00', endAt: '2032-01-01T11:00:00+08:00', reason: '   ' }, 400);
+  await G('/api/unavailability', null, 401);
+  check('不可用登记：导演 403 / 无时区 / 起止颠倒 / 空原因 / 未登录 均被拒', true);
+
+  const schU1 = (await J(`/api/rehearsals/${rhU}/schedules`, director, { sceneId: at1, startAt: '2032-01-01T10:00:00+08:00', endAt: '2032-01-01T11:00:00+08:00' }, 201)).schedule;
+  // 与本人当前参与的有效日程重叠 -> 整次拒绝并指出冲突日程
+  const uaOv = await J('/api/unavailability', lin, { startAt: '2032-01-01T10:30:00+08:00', endAt: '2032-01-01T11:30:00+08:00', reason: '看病' }, 409);
+  check('登记撞本人有效日程 -> UNAVAILABILITY_CONFLICT', uaOv.error === 'UNAVAILABILITY_CONFLICT' && uaOv.details.conflicts[0].schedule.id === schU1.id, JSON.stringify(uaOv));
+  const uaActiveAfterFail = (await G('/api/unavailability?status=active', lin)).unavailability;
+  check('被拒绝的登记不落库', !uaActiveAfterFail.some((u) => u.startAt === '2032-01-01T02:30:00.000Z'));
+  // 跨排练有效日程同样挡（schA1 在 rhA：林晚 2030-01-01 10:00-11:00+08）
+  const uaOvReh = await J('/api/unavailability', lin, { startAt: '2030-01-01T10:30:00+08:00', endAt: '2030-01-01T10:45:00+08:00', reason: '跨排练' }, 409);
+  check('跨排练的本人有效日程也冲突', uaOvReh.details.conflicts.some((c) => c.schedule.id === schA1.id));
+  // 端点相接不算重叠；UTC 归一化（11:00+08:00 = 03:00Z）
+  const uaTouch1 = (await J('/api/unavailability', lin, { startAt: '2032-01-01T09:00:00+08:00', endAt: '2032-01-01T10:00:00+08:00', reason: '前置' }, 201)).unavailability;
+  const uaTouch2 = (await J('/api/unavailability', lin, { startAt: '2032-01-01T11:00:00+08:00', endAt: '2032-01-01T12:00:00+08:00', reason: '后置' }, 201)).unavailability;
+  check('端点相接可登记且按 UTC 保存', uaTouch2.startAt === '2032-01-01T03:00:00.000Z' && uaTouch2.endAt === '2032-01-01T04:00:00.000Z', JSON.stringify(uaTouch2));
+
+  console.log('— 不可用时段：修改 / 撤销 / 越权 —');
+  const uaPatchOv = await req('PATCH', `/api/unavailability/${uaTouch2.id}`, lin, { startAt: '2032-01-01T10:30:00+08:00', endAt: '2032-01-01T10:45:00+08:00' }, 409);
+  check('修改后撞日程 -> 整次拒绝', uaPatchOv.error === 'UNAVAILABILITY_CONFLICT');
+  const uaPatched = (await req('PATCH', `/api/unavailability/${uaTouch2.id}`, lin, { reason: '后置（改原因）' }, 200)).unavailability;
+  check('仅修改原因成功且时间不变', uaPatched.reason === '后置（改原因）' && uaPatched.startAt === '2032-01-01T03:00:00.000Z' && !!uaPatched.updatedAt);
+  await req('PATCH', '/api/unavailability/99999', lin, { reason: 'x' }, 404);
+  await req('PATCH', `/api/unavailability/${uaTouch2.id}`, chen, { reason: 'x' }, 404);
+  check('修改不存在 / 他人记录 -> 404', true);
+  await J(`/api/unavailability/${uaTouch1.id}/cancel`, lin, {}, 200);
+  await J(`/api/unavailability/${uaTouch1.id}/cancel`, lin, {}, 400);
+  await req('PATCH', `/api/unavailability/${uaTouch1.id}`, lin, { reason: 'x' }, 400);
+  check('撤销成功；重复撤销 400；已撤销不可修改', true);
+  await J(`/api/unavailability/${uaTouch2.id}/cancel`, lin, {}, 200);
+
+  console.log('— 不可用时段：已取消 / 待调整日程不参与演员侧检测 —');
+  // schU1 已取消 -> 在其时间上登记不可用不再被挡
+  await J(`/api/rehearsals/${rhU}/schedules/${schU1.id}/cancel`, director, {}, 200);
+  const uaOverCancelled = (await J('/api/unavailability', lin, { startAt: '2032-01-01T10:30:00+08:00', endAt: '2032-01-01T10:45:00+08:00', reason: '日程已取消' }, 201)).unavailability;
+  check('已取消日程不参与冲突', uaOverCancelled.id > 0);
+  await J(`/api/unavailability/${uaOverCancelled.id}/cancel`, lin, {}, 200);
+  // schE1 待调整（rhE 已换 pv3，林晚当前版本在 sc2 无台词）
+  const uaOverNeedsAdj = (await J('/api/unavailability', lin, { startAt: '2030-01-05T10:30:00+08:00', endAt: '2030-01-05T10:45:00+08:00', reason: '待调整' }, 201)).unavailability;
+  check('待调整日程不参与冲突', uaOverNeedsAdj.id > 0);
+  await J(`/api/unavailability/${uaOverNeedsAdj.id}/cancel`, lin, {}, 200);
+
+  console.log('— 导演操作：安排/调整撞演员不可用整次不生效 —');
+  const rhU2 = (await J(`/api/plays/${p3.id}/rehearsals`, director, { versionId: p3v1, name: '不可用排练2' }, 201)).id;
+  await J(`/api/rehearsals/${rhU2}/cast`, director, { roleId: roleX, actorId: linId }, 201);
+  const uaU2 = (await J('/api/unavailability', lin, { startAt: '2032-03-01T10:00:00+08:00', endAt: '2032-03-01T12:00:00+08:00', reason: '体检' }, 201)).unavailability;
+  const schedUaOv = await J(`/api/rehearsals/${rhU2}/schedules`, director, { sceneId: at1, startAt: '2032-03-01T10:30:00+08:00', endAt: '2032-03-01T11:30:00+08:00' }, 409);
+  check('安排撞不可用 -> UNAVAILABILITY_CONFLICT 且返回演员/日程/不可用时段',
+    schedUaOv.error === 'UNAVAILABILITY_CONFLICT'
+      && schedUaOv.details.conflicts[0].actorId === linId
+      && schedUaOv.details.conflicts[0].schedule.id === null
+      && schedUaOv.details.conflicts[0].unavailability.id === uaU2.id
+      && schedUaOv.details.conflicts[0].unavailability.reason === '体检',
+    JSON.stringify(schedUaOv));
+  check('被拒安排不落库', (await G(`/api/rehearsals/${rhU2}/schedules`, director)).schedules.length === 0);
+  // 端点相接可安排
+  const schU2 = (await J(`/api/rehearsals/${rhU2}/schedules`, director, { sceneId: at1, startAt: '2032-03-01T12:00:00+08:00', endAt: '2032-03-01T13:00:00+08:00' }, 201)).schedule;
+  const patchUaOv = await req('PATCH', `/api/rehearsals/${rhU2}/schedules/${schU2.id}`, director, { startAt: '2032-03-01T11:00:00+08:00', endAt: '2032-03-01T11:30:00+08:00' }, 409);
+  check('调整撞不可用 -> 整次拒绝', patchUaOv.error === 'UNAVAILABILITY_CONFLICT');
+  const schU2After = (await G(`/api/rehearsals/${rhU2}/schedules`, director)).schedules[0];
+  check('被拒调整不改写原时段', schU2After.startAt === '2032-03-01T04:00:00.000Z', schU2After.startAt);
+  // 有效日程的参与者序列化带 unavailabilityOverlaps 字段（相接不重叠 => 空）
+  check('导演日程参与者带不可用相撞信息字段', Array.isArray(schU2After.participants[0].unavailabilityOverlaps) && schU2After.participants[0].unavailabilityOverlaps.length === 0);
+
+  console.log('— 导演操作：派角/改派撞不可用整次回滚；日程互撞优先 409 SCHEDULE_CONFLICT —');
+  // RH_V 暂不派角：S1(AT1) 与 S2(AT2) 互相重叠；林晚先登记不可用
+  const rhV = (await J(`/api/plays/${p3.id}/rehearsals`, director, { versionId: p3v1, name: '不可用排练3' }, 201)).id;
+  const sV1 = (await J(`/api/rehearsals/${rhV}/schedules`, director, { sceneId: at1, startAt: '2032-04-01T10:00:00+08:00', endAt: '2032-04-01T12:00:00+08:00' }, 201)).schedule;
+  await J(`/api/rehearsals/${rhV}/schedules`, director, { sceneId: at2, startAt: '2032-04-01T11:00:00+08:00', endAt: '2032-04-01T13:00:00+08:00' }, 201);
+  await J('/api/unavailability', lin, { startAt: '2032-04-01T10:30:00+08:00', endAt: '2032-04-01T10:45:00+08:00', reason: '面试' }, 201);
+  // 林晚不是参与者时可自由安排；此时 RX 在两个场次都有台词，派角将同时撞日程与不可用
+  const castPrecedence = await J(`/api/rehearsals/${rhV}/cast`, director, { roleId: roleX, actorId: linId }, 409);
+  check('日程互撞与不可用同时存在时优先 SCHEDULE_CONFLICT', castPrecedence.error === 'SCHEDULE_CONFLICT');
+  // 解除日程互撞（S2 改为端点相接），参与者仍为空，调整不受不可用影响
+  const sV2Id = (await G(`/api/rehearsals/${rhV}/schedules`, director)).schedules.find((s) => s.sceneId === at2).id;
+  await req('PATCH', `/api/rehearsals/${rhV}/schedules/${sV2Id}`, director, { startAt: '2032-04-01T12:00:00+08:00', endAt: '2032-04-01T13:00:00+08:00' }, 200);
+  const castUa = await J(`/api/rehearsals/${rhV}/cast`, director, { roleId: roleX, actorId: linId }, 409);
+  check('派角撞不可用 -> UNAVAILABILITY_CONFLICT 并回滚',
+    castUa.error === 'UNAVAILABILITY_CONFLICT'
+      && castUa.details.conflicts.some((c) => c.actorId === linId && c.schedule.id === sV1.id),
+    JSON.stringify(castUa));
+  check('被拒派角不落库', (await G(`/api/rehearsals/${rhV}`, director)).cast.length === 0);
+  // 演员撤销不可用后派角成功
+  const uaVId = (await G('/api/unavailability?status=active', lin)).unavailability.find((u) => u.reason === '面试').id;
+  await J(`/api/unavailability/${uaVId}/cancel`, lin, {}, 200);
+  await J(`/api/rehearsals/${rhV}/cast`, director, { roleId: roleX, actorId: linId }, 201);
+  check('撤销不可用后派角成功', true);
+
+  console.log('— 导演操作：显式换版撞不可用整次回滚 —');
+  // RH_W 固定 p2 v1：乙(陈默) 在 v1 的 sc1 无台词；v2 新增乙在 sc1 的台词
+  const rhW = (await J(`/api/plays/${p2.id}/rehearsals`, director, { versionId: pv1, name: '不可用排练4' }, 201)).id;
+  await J(`/api/rehearsals/${rhW}/cast`, director, { roleId: roleB, actorId: chenId }, 201);
+  const sW1 = (await J(`/api/rehearsals/${rhW}/schedules`, director, { sceneId: sc1, startAt: '2032-05-01T10:00:00+08:00', endAt: '2032-05-01T11:00:00+08:00' }, 201)).schedule;
+  check('v1 中乙在 sc1 无台词：参与者为空', sW1.participants.length === 0);
+  await J('/api/unavailability', chen, { startAt: '2032-05-01T10:30:00+08:00', endAt: '2032-05-01T10:45:00+08:00', reason: '家中有事' }, 201);
+  const swUa = await J(`/api/rehearsals/${rhW}/switch-version`, director, { versionId: pv2 }, 409);
+  check('换版使陈默成为该时段参与者且撞其不可用 -> 整次拒绝',
+    swUa.error === 'UNAVAILABILITY_CONFLICT' && swUa.details.conflicts.some((c) => c.actorId === chenId && c.schedule.id === sW1.id),
+    JSON.stringify(swUa));
+  check('失败换版不改变固定版本', (await G(`/api/rehearsals/${rhW}`, director)).rehearsal.versionId === pv1);
+  const uaWId = (await G('/api/unavailability?status=active', chen)).unavailability.find((u) => u.reason === '家中有事').id;
+  await J(`/api/unavailability/${uaWId}/cancel`, chen, {}, 200);
+  const swOkU = await J(`/api/rehearsals/${rhW}/switch-version`, director, { versionId: pv2 }, 200);
+  check('撤销不可用后换版成功', swOkU.rehearsal.versionId === pv2);
+
+  console.log('— 不可用变化不改写已开启登记；可见性 —');
+  // schU2 有效且林晚在名单：开启签到，再登记/调整相邻不可用不影响名单与签到
+  const attU = (await J(`/api/rehearsals/${rhU2}/schedules/${schU2.id}/attendance`, director, {}, 201)).session;
+  check('不可用存在时仍可对有效时段开启登记（名单冻结）', attU.roster.length === 1 && attU.roster[0].actorId === linId);
+  await J(`/api/rehearsals/${rhU2}/schedules/${schU2.id}/attendance/check-in`, lin, {}, 201);
+  await J('/api/unavailability', lin, { startAt: '2032-03-01T13:00:00+08:00', endAt: '2032-03-01T14:00:00+08:00', reason: '签到后登记' }, 201);
+  const attU2 = (await G(`/api/rehearsals/${rhU2}/schedules/${schU2.id}/attendance`, director)).session;
+  check('不可用变化不改写名单与签到', attU2.roster.length === 1 && attU2.stats.checkedIn === 1);
+  // 可见性：导演按演员查（可过滤状态）；演员只看本人
+  const dirUa = await G(`/api/unavailability?actorId=${linId}`, director);
+  check('导演可查看演员不可用记录', dirUa.unavailability.every((u) => u.actorId === linId) && dirUa.unavailability.length >= 2);
+  const dirUaActive = await G(`/api/unavailability?actorId=${linId}&status=active`, director);
+  check('导演可按状态过滤', dirUaActive.unavailability.every((u) => u.status === 'active'));
+  await G('/api/unavailability', director, 400);
+  await G('/api/unavailability?actorId=99999', director, 404);
+  const linScoped = await G(`/api/unavailability?actorId=${chenId}`, lin);
+  check('演员带 actorId 仍只返回本人记录', linScoped.unavailability.every((u) => u.actorId === linId));
+
   console.log(failures === 0 ? '\n全部通过 🎉' : `\n${failures} 项失败`);
   process.exit(failures === 0 ? 0 : 1);
 }

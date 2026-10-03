@@ -10,7 +10,7 @@ function fmtTime(iso) {
   return new Date(iso).toLocaleString('zh-CN', { hour12: false });
 }
 
-/** 日程冲突（409 SCHEDULE_CONFLICT）时把冲突演员一并提示 */
+/** 日程/不可用冲突（409）时把冲突演员一并提示 */
 function scheduleErr(err) {
   const conflicts = err?.data?.details?.conflicts;
   if (Array.isArray(conflicts) && conflicts.length) {
@@ -199,7 +199,7 @@ function renderRehearsalDetail(data, reload) {
         <button class="btn small primary schedSubmit" type="submit">保存时段</button>
         <button class="btn small schedCancelEdit hidden" type="button">放弃调整</button>
       </form>
-      <div class="muted">按本地时间选择，提交时自动携带时区；结束须晚于开始。未派角角色列为“待补派”，不阻止安排。</div>
+      <div class="muted">按本地时间选择，提交时自动携带时区；结束须晚于开始。未派角角色列为“待补派”，不阻止安排。保存/调整、派角/改派、显式换版都会检查受影响演员的“不可用时段”，相撞整次不生效。</div>
     </div>`);
   wrap.appendChild(schedBox);
   setupScheduleEditor(schedBox, rehearsal);
@@ -329,7 +329,14 @@ function setupScheduleEditor(schedBox, rehearsal) {
         <td>${esc(s.sceneCode)} ${esc(s.sceneTitle)}</td>
         <td>${fmtTime(s.startAt)} → ${fmtTime(s.endAt)}</td>
         <td><span class="badge ${SCHED_STATUS_CLASS[s.status]}">${SCHED_STATUS_LABEL[s.status]}</span></td>
-        <td>${s.participants.map((p) => esc(p.actorName)).join('、') || '<span class="muted">无</span>'}</td>
+        <td>${s.participants.length
+          ? s.participants.map((p) => {
+              const ov = p.unavailabilityOverlaps || [];
+              return `${esc(p.actorName)}${ov.length
+                ? ` <span class="badge abandoned" title="${ov.map((u) => `${fmtTime(u.startAt)}–${fmtTime(u.endAt)} ${u.reason}`).join('；')}">不可用×${ov.length}</span>`
+                : ''}`;
+            }).join('、')
+          : '<span class="muted">无</span>'}</td>
         <td>${s.pendingCast.map((p) => esc(p.roleName)).join('、') || '—'}</td>
         <td>${attendanceCell(s)}</td>
         <td>${s.status !== 'cancelled'
@@ -453,6 +460,7 @@ async function loadActorHome() {
   panel.innerHTML = '<p class="muted">加载中…</p>';
   const { rehearsals } = await api('GET', '/api/rehearsals');
   panel.innerHTML = '';
+  panel.appendChild(await loadUnavailabilityCard());
   const card = el('<div class="card"><h2>我的排练</h2></div>');
   for (const r of rehearsals) {
     const row = el(`

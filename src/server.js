@@ -9,6 +9,7 @@ const { router: revisionsRouter } = require('./revisions');
 const { router: rehearsalsRouter, rehearsalPending } = require('./rehearsals');
 const { router: schedulesRouter } = require('./schedules');
 const { router: attendanceRouter } = require('./attendance');
+const { router: unavailabilityRouter } = require('./unavailability');
 const { db } = require('./db');
 
 const PORT = Number(process.env.PORT || 3000);
@@ -38,6 +39,7 @@ app.use('/api', revisionsRouter);
 app.use('/api', rehearsalsRouter);
 app.use('/api', schedulesRouter);
 app.use('/api', attendanceRouter);
+app.use('/api', unavailabilityRouter);
 
 // 演员名册（仅导演）
 app.get(

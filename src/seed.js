@@ -67,6 +67,14 @@ function seed() {
     db.prepare(
       'INSERT INTO rehearsal_schedules (rehearsal_id, scene_id, start_at, end_at, created_by) VALUES (?, ?, ?, ?, ?)'
     ).run(rehearsal, s1, '2026-10-10T06:00:00.000Z', '2026-10-10T07:30:00.000Z', director);
+
+    // 示例不可用时段（归一化为 UTC；刻意不与上面 2026-10-10 的示例日程重叠）
+    db.prepare(
+      'INSERT INTO actor_unavailability (actor_id, start_at, end_at, reason) VALUES (?, ?, ?, ?)'
+    ).run(lin, '2026-10-11T12:00:00.000Z', '2026-10-11T16:00:00.000Z', '赴外地参加诗会，整日不在团里');
+    db.prepare(
+      'INSERT INTO actor_unavailability (actor_id, start_at, end_at, reason) VALUES (?, ?, ?, ?)'
+    ).run(chen, '2026-10-12T01:00:00.000Z', '2026-10-12T05:00:00.000Z', '上午体检（+09:00 10:00–14:00）');
   });
 
   return true;
