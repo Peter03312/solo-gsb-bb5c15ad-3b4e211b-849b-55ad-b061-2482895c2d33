@@ -10,12 +10,42 @@ function fmtTime(iso) {
   return new Date(iso).toLocaleString('zh-CN', { hour12: false });
 }
 
-/** 日程冲突（409 SCHEDULE_CONFLICT）时把冲突演员一并提示 */
+/** ISO(UTC) -> datetime-local 输入框所需的本地时间串 */
+function toLocalInput(iso) {
+  const d = new Date(iso);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** 日程冲突（409 SCHEDULE_CONFLICT / UNAVAILABILITY_CONFLICT）时把冲突演员与不可用时段一并提示 */
 function scheduleErr(err) {
   const conflicts = err?.data?.details?.conflicts;
   if (Array.isArray(conflicts) && conflicts.length) {
     const actors = [...new Set(conflicts.map((c) => c.actorName))].join('、');
-    return `${err.message}（冲突演员：${actors}）`;
+    let msg = `${err.message}（冲突演员：${actors}）`;
+    const unavs = conflicts.filter((c) => c.unavailability);
+    if (unavs.length) {
+      const info = unavs.map(
+        (c) =>
+          `${c.actorName} ${fmtTime(c.unavailability.startAt)}→${fmtTime(c.unavailability.endAt)}` +
+          `${c.unavailability.reason ? `（${c.unavailability.reason}）` : ''}`
+      );
+      msg += `；不可用时段：${[...new Set(info)].join('；')}`;
+    }
+    return msg;
+  }
+  return err.message;
+}
+
+/** 演员提交/修改不可用时段被拒（409 UNAVAILABILITY_CONFLICT）时指出冲突日程 */
+function unavailabilityErr(err) {
+  const conflicts = err?.data?.details?.conflicts;
+  if (Array.isArray(conflicts) && conflicts.length) {
+    const scheds = conflicts.map((c) => {
+      const s = c.schedule || {};
+      return `${s.sceneTitle || '日程'} ${s.startAt ? fmtTime(s.startAt) : ''}→${s.endAt ? fmtTime(s.endAt) : ''}`;
+    });
+    return `${err.message}（冲突日程：${[...new Set(scheds)].join('；')}）`;
   }
   return err.message;
 }
@@ -297,11 +327,6 @@ function setupScheduleEditor(schedBox, rehearsal) {
       .join('');
   });
 
-  const toLocalInput = (iso) => {
-    const d = new Date(iso);
-    const pad = (n) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  };
   const resetEdit = () => {
     editingId = null;
     submitBtn.textContent = '保存时段';
@@ -466,6 +491,109 @@ async function loadActorHome() {
   }
   if (!rehearsals.length) card.innerHTML += '<p class="muted">你暂时没有被分配到任何排练。</p>';
   panel.appendChild(card);
+  panel.appendChild(renderUnavailabilityCard());
+}
+
+/** 演员：我的不可用时段（登记/修改/撤销；与本人有效日程重叠会被整次拒绝） */
+function renderUnavailabilityCard() {
+  const card = el(`
+    <div class="card">
+      <h2>我的不可用时段</h2>
+      <div class="unavRows muted">加载中…</div>
+      <form class="flex unavForm" style="margin-top:6px">
+        <input type="datetime-local" name="startAt" required style="max-width:210px" />
+        <input type="datetime-local" name="endAt" required style="max-width:210px" />
+        <input name="reason" placeholder="原因（必填）" required style="max-width:180px" />
+        <button class="btn small primary unavSubmit" type="submit">登记不可用</button>
+        <button class="btn small unavCancelEdit hidden" type="button">放弃修改</button>
+      </form>
+      <div class="muted">按本地时间选择，提交时自动携带时区，系统按 UTC 保存；结束须晚于开始，端点相接不算重叠。
+        若与本人当前参与的有效排练日程重叠，登记/修改会被整次拒绝。</div>
+    </div>`);
+  const rowsBox = card.querySelector('.unavRows');
+  const form = card.querySelector('.unavForm');
+  const submitBtn = card.querySelector('.unavSubmit');
+  const cancelEditBtn = card.querySelector('.unavCancelEdit');
+  let editingId = null;
+  const resetEdit = () => {
+    editingId = null;
+    submitBtn.textContent = '登记不可用';
+    cancelEditBtn.classList.add('hidden');
+    form.reset();
+  };
+  cancelEditBtn.addEventListener('click', resetEdit);
+
+  async function reload() {
+    let items;
+    try {
+      ({ unavailability: items } = await api('GET', '/api/me/unavailability'));
+    } catch (err) {
+      rowsBox.innerHTML = `<span class="muted">${esc(err.message)}</span>`;
+      return;
+    }
+    if (!items.length) {
+      rowsBox.innerHTML = '<span class="muted">暂无不可用时段</span>';
+      return;
+    }
+    rowsBox.innerHTML = `<table>
+      <tr><th>开始</th><th>结束</th><th>原因</th><th>操作</th></tr>
+      ${items.map((u) => `<tr>
+        <td>${fmtTime(u.startAt)}</td>
+        <td>${fmtTime(u.endAt)}</td>
+        <td>${esc(u.reason)}</td>
+        <td>
+          <button class="btn small editUnav" data-id="${u.id}">修改</button>
+          <button class="btn small danger delUnav" data-id="${u.id}">撤销</button>
+        </td>
+      </tr>`).join('')}
+    </table>`;
+    rowsBox.querySelectorAll('.editUnav').forEach((b) =>
+      b.addEventListener('click', () => {
+        const u = items.find((x) => String(x.id) === b.dataset.id);
+        if (!u) return;
+        editingId = u.id;
+        form.querySelector('[name=startAt]').value = toLocalInput(u.startAt);
+        form.querySelector('[name=endAt]').value = toLocalInput(u.endAt);
+        form.querySelector('[name=reason]').value = u.reason;
+        submitBtn.textContent = '保存修改';
+        cancelEditBtn.classList.remove('hidden');
+      })
+    );
+    rowsBox.querySelectorAll('.delUnav').forEach((b) =>
+      b.addEventListener('click', async () => {
+        try {
+          await api('DELETE', `/api/me/unavailability/${b.dataset.id}`);
+          toast('该不可用时段已撤销');
+          if (editingId === Number(b.dataset.id)) resetEdit();
+          reload();
+        } catch (err) { toast(err.message, true); }
+      })
+    );
+  }
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const body = {
+      startAt: new Date(fd.get('startAt')).toISOString(),
+      endAt: new Date(fd.get('endAt')).toISOString(),
+      reason: fd.get('reason'),
+    };
+    try {
+      if (editingId) {
+        await api('PATCH', `/api/me/unavailability/${editingId}`, body);
+        toast('不可用时段已修改');
+      } else {
+        await api('POST', '/api/me/unavailability', body);
+        toast('不可用时段已登记');
+      }
+      resetEdit();
+      reload();
+    } catch (err) { toast(unavailabilityErr(err), true); }
+  });
+
+  reload();
+  return card;
 }
 
 async function loadActorScript(rehearsalId) {

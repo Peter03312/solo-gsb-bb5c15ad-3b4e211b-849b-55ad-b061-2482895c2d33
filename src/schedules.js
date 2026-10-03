@@ -12,6 +12,8 @@ const { authRequired } = require('./auth');
  *   - 场次须属于该剧且在当前固定版本中有台词；结束必须晚于开始。
  *   - 新建/调整时段、派角/改派、换版时，若参与演员与其他“未取消”时段
  *     （待调整不计入）重叠，整次操作拒绝并返回冲突演员与时段（409 SCHEDULE_CONFLICT）。
+ *   - 上述操作同时检查参与演员登记的“不可用时段”（actor_unavailability），
+ *     相撞即整次不生效，返回演员、日程及不可用时段（409 UNAVAILABILITY_CONFLICT）。
  *   - 端点相接不算重叠（半开区间 [start, end)）。
  *   - 换版后场次在新版本中已无台词的既有安排标为“待调整”，不参与冲突检测；
  *     失败的换版整体回滚，不改变版本与确认。
@@ -196,6 +198,48 @@ function assertNoScheduleConflicts(candidates, message = '参与演员与其他�
   if (conflicts.length) throw conflict('SCHEDULE_CONFLICT', message, { conflicts });
 }
 
+/** 不可用时段引用（冲突详情用）：返回演员、日程及不可用时段三者中的“不可用时段” */
+function unavailabilityRef(u) {
+  return { id: u.id, startAt: u.start_at, endAt: u.end_at, reason: u.reason };
+}
+
+/**
+ * 不可用时段冲突检测：候选时段的参与演员，若其本人登记的不可用时段与候选重叠即冲突。
+ * 返回按“演员 × 候选时段 × 不可用记录”去重后的冲突列表（含演员、日程、不可用时段）。
+ */
+function findUnavailabilityConflicts(candidates) {
+  const actorIds = [...new Set(candidates.flatMap((c) => c.actorIds))];
+  if (!candidates.length || !actorIds.length) return [];
+  const placeholders = actorIds.map(() => '?').join(',');
+  const rows = db
+    .prepare(`SELECT * FROM actor_unavailability WHERE actor_id IN (${placeholders})`)
+    .all(...actorIds);
+  const conflicts = [];
+  const seen = new Set();
+  for (const cand of candidates) {
+    for (const u of rows) {
+      if (!cand.actorIds.includes(u.actor_id)) continue;
+      if (!overlaps(cand.startMs, cand.endMs, Date.parse(u.start_at), Date.parse(u.end_at))) continue;
+      const key = `${u.actor_id}|${slotKey(cand)}|u:${u.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const actor = db.prepare('SELECT display_name FROM users WHERE id = ?').get(u.actor_id);
+      conflicts.push({
+        actorId: u.actor_id,
+        actorName: actor?.display_name ?? `#${u.actor_id}`,
+        schedule: slotRef(cand),
+        unavailability: unavailabilityRef(u),
+      });
+    }
+  }
+  return conflicts;
+}
+
+function assertNoUnavailabilityConflicts(candidates, message) {
+  const conflicts = findUnavailabilityConflicts(candidates);
+  if (conflicts.length) throw conflict('UNAVAILABILITY_CONFLICT', message, { conflicts });
+}
+
 /** 派角/改派后（事务内调用）：整排练的有效时段按新派角重算参与者，冲突则抛 409 回滚 */
 function assertRehearsalSchedulesAfterCastChange(rehearsalId) {
   const rehearsal = db.prepare('SELECT * FROM rehearsals WHERE id = ?').get(rehearsalId);
@@ -207,6 +251,7 @@ function assertRehearsalSchedulesAfterCastChange(rehearsalId) {
     buildCandidate({ scheduleId: s.id, rehearsal, sceneId: s.scene_id, startAt: s.start_at, endAt: s.end_at })
   );
   assertNoScheduleConflicts(candidates, '派角后参与演员与其他未取消时段重叠，本次派角未生效');
+  assertNoUnavailabilityConflicts(candidates, '派角后参与演员与其登记的不可用时段相撞，本次派角未生效');
 }
 
 /**
@@ -245,6 +290,7 @@ function applySchedulesAfterVersionSwitch(rehearsalId, newVersionId) {
     })
   );
   assertNoScheduleConflicts(candidates, '换版后参与演员与其他未取消时段重叠，本次换版未生效');
+  assertNoUnavailabilityConflicts(candidates, '换版后参与演员与其登记的不可用时段相撞，本次换版未生效');
   return needsAdjustment;
 }
 
@@ -358,8 +404,10 @@ router.post(
     const r = getRehearsalOrThrow(req.params.id);
     const { sceneId, startAt, endAt } = validateSceneAndTimes(r, req.body, null);
     const id = transaction(() => {
-      // 参与演员与其他未取消时段重叠 -> 整次拒绝
-      assertNoScheduleConflicts([buildCandidate({ rehearsal: r, sceneId, startAt, endAt })]);
+      // 参与演员与其他未取消时段重叠 -> 整次拒绝；参与演员撞上其不可用时段 -> 整次拒绝
+      const cand = buildCandidate({ rehearsal: r, sceneId, startAt, endAt });
+      assertNoScheduleConflicts([cand]);
+      assertNoUnavailabilityConflicts([cand], '参与演员在该时段已登记不可用，本次安排未生效');
       return db
         .prepare(
           'INSERT INTO rehearsal_schedules (rehearsal_id, scene_id, start_at, end_at, created_by) VALUES (?, ?, ?, ?, ?)'
@@ -413,8 +461,10 @@ router.patch(
       db.prepare(
         "UPDATE rehearsal_schedules SET scene_id = ?, start_at = ?, end_at = ?, status = 'active' WHERE id = ?"
       ).run(sceneId, startAt, endAt, s.id);
-      // 调整后的参与演员与其他未取消时段重叠 -> 整次拒绝（事务回滚）
-      assertNoScheduleConflicts([buildCandidate({ scheduleId: s.id, rehearsal: r, sceneId, startAt, endAt })]);
+      // 调整后的参与演员与其他未取消时段重叠 -> 整次拒绝（事务回滚）；撞上不可用时段同样整次拒绝
+      const cand = buildCandidate({ scheduleId: s.id, rehearsal: r, sceneId, startAt, endAt });
+      assertNoScheduleConflicts([cand]);
+      assertNoUnavailabilityConflicts([cand], '参与演员在该时段已登记不可用，本次调整未生效');
     });
     res.json({ schedule: serializeSchedule(getScheduleOrThrow(s.id, r.id), r) });
   })
@@ -444,4 +494,11 @@ router.post(
   })
 );
 
-module.exports = { router, assertRehearsalSchedulesAfterCastChange, applySchedulesAfterVersionSwitch, participantDetails };
+module.exports = {
+  router,
+  assertRehearsalSchedulesAfterCastChange,
+  applySchedulesAfterVersionSwitch,
+  participantDetails,
+  parseTzDateTime,
+  slotRef,
+};

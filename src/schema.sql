@@ -207,6 +207,22 @@ CREATE TABLE IF NOT EXISTS rehearsal_schedules (
 );
 CREATE INDEX IF NOT EXISTS idx_schedules_rehearsal ON rehearsal_schedules(rehearsal_id);
 
+-- 演员不可用时段：演员登记/修改/撤销自己的不可用时间（带时区提交，服务端归一化为 UTC 存储）
+--   * 结束必须晚于开始；重叠判定为半开区间 [start, end)：端点相接不算重叠
+--   * 演员提交/修改时与本人当前参与的有效日程重叠 -> 整次拒绝并指出冲突日程
+--   * 导演排期/调期、派角/改派、显式换版时，参与演员撞上不可用时段 -> 整次不生效
+--   * 已取消与待调整日程不参与；开启过的到场登记名单与签到不因此改写
+CREATE TABLE IF NOT EXISTS actor_unavailability (
+  id         INTEGER PRIMARY KEY,
+  actor_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  start_at   TEXT NOT NULL,
+  end_at     TEXT NOT NULL,
+  reason     TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_unavailability_actor ON actor_unavailability(actor_id);
+
 -- 到场登记：导演为“有效”日程时段开启的一次性签到。
 --   * 每个日程时段至多一次登记（schedule_id 唯一；已有登记——含已关闭/已作废——不得再开）
 --   * 开启时冻结：场次、UTC 起止时段、排练当时固定版本；此后改派/换版/调整日程均不回写

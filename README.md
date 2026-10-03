@@ -47,6 +47,20 @@
 6. 导演可**取消**安排，并查看待补派、待调整与已取消的安排（`?status=` 可过滤）；
    演员只能看到**自己当前参与的有效时段**。
 
+### 演员不可用时段
+
+1. 演员可**登记、修改、撤销**自己的不可用时段：输入**带时区**的起止时间（ISO 8601，如
+   `2026-10-03T14:00:00+08:00` 或 `...Z`）与**原因**；服务端归一化为 **UTC** 保存，
+   **结束必须晚于开始**，**端点相接不算重叠**（半开区间 `[start, end)`）。
+2. 演员**提交或修改**时，若与本人**当前参与的有效排练日程**重叠，**整次拒绝**并在
+   `details.conflicts` 中指出冲突日程（`409 UNAVAILABILITY_CONFLICT`）。
+3. 导演**安排/调整日程、派角/改派、显式换版**时，同样检查受影响演员的不可用时段：
+   一旦相撞，**整次操作不生效**，`details.conflicts` 返回**演员、日程及不可用时段**；
+   **已取消和待调整日程不参与**检测；已有日程之间的互撞仍按现有 `409 SCHEDULE_CONFLICT` 处理。
+4. 开启过的**到场登记名单与签到不因不可用时段变化而改写**（登记仍是开启时的冻结快照）。
+5. 演员可查看**本人**不可用记录（接口仅对演员开放）；导演在排期冲突响应中看到必要的
+   演员/日程/不可用时段信息。
+
 ### 到场登记（按时段一次性签到）
 
 1. 导演可为**有效**（`active`）日程时段**开启一次**到场登记；已取消、待调整或已有登记
@@ -143,10 +157,12 @@ PORT=8080 docker compose up --build -d
   勾选多个修订发布；冲突时页面展示每处冲突的“修订声称原文 vs 现行文本”，并可在发布记录中回看。
 - **导演 → 排练与确认**：创建固定版本的排练、显式换版、派角/改派，查看待确认清单与冲突；
   为场次安排/调整/取消带时区的排练时段，查看参与者与待补派；对有效时段**开启/查看/关闭到场登记**
-  （名单、缺口、应到/签到/缺席统计）。
+  （名单、缺口、应到/签到/缺席统计）。排期/调期/派角/换版若撞上演员不可用时段，
+  页面会提示冲突演员及其不可用时段与原因。
 - **导演 → 总览**：所有排练的待确认汇总与最近冲突详情。
 - **演员**：进入排练后仅显示本人角色台词，按场次点“确认本场台词”；换版或改派后相应场次会回到待确认；
-  可查看自己当前参与的排练时段，并在登记开放期为本人**到场签到**。
+  可查看自己当前参与的排练时段，并在登记开放期为本人**到场签到**；
+  在“我的不可用时段”中**登记/修改/撤销**不可用时间（与本人有效日程重叠会被整次拒绝并指出冲突日程）。
 
 ## HTTP API 摘要（均返回 JSON，会话用 Cookie 或 `Authorization: Bearer <token>`）
 
@@ -177,12 +193,14 @@ PORT=8080 docker compose up --build -d
 | POST | `/api/rehearsals/:id/schedules/:sid/attendance/close` | 关闭登记（导演；未签到者记缺席） |
 | POST | `/api/rehearsals/:id/schedules/:sid/attendance/check-in` | 演员本人签到（开放期+名单内；重试返回首次结果） |
 | GET | `/api/rehearsals/:id/schedules/:sid/attendance` | 登记详情（导演：名单/缺口/统计；演员：仅本人记录） |
+| GET/POST | `/api/me/unavailability` | 演员查看 / 登记本人不可用时段（带时区起止+原因，UTC 保存；撞本人有效日程 409） |
+| PATCH/DELETE | `/api/me/unavailability/:id` | 演员修改 / 撤销本人不可用时段（修改同样做重叠校验） |
 | GET | `/api/dashboard` | 导演总览 |
 
 错误统一形如 `{ "error": "CODE", "message": "...", "details": ... }`，
 典型状态码：`400`（无效版本/场次/参数、状态不允许的操作）、`401`（未登录）、`403`（越权）、`404`（不存在）、
 `409`（业务冲突，如 `OLD_TEXT_MISMATCH`、`PUBLISH_CONFLICT`、`SCHEDULE_CONFLICT`、
-`ATTENDANCE_EXISTS`、`ATTENDANCE_NOT_OPEN`）。
+`UNAVAILABILITY_CONFLICT`、`ATTENDANCE_EXISTS`、`ATTENDANCE_NOT_OPEN`）。
 
 ## 日程接口调用示例（curl）
 
@@ -294,13 +312,66 @@ curl -s http://localhost:3000/api/rehearsals/1/schedules -H "Authorization: Bear
 开启登记后的改派、换版、调整日程（`PATCH /schedules/:sid`）均**不回写**名单与签到：
 登记响应中的 `versionId`、`startAt/endAt`、`roster`、`gaps` 始终保持开启时快照。
 
+## 不可用时段接口调用示例（curl）
+
+```bash
+# 1. 演员登录，拿到 token（lin / actor123）
+curl -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"lin","password":"actor123"}'
+# -> {"token":"<ACTOR_TOKEN>",...}
+
+# 2. 登记不可用时段：带时区起止 + 原因；服务端按 UTC 保存（结束须晚于开始）
+curl -s -X POST http://localhost:3000/api/me/unavailability \
+  -H "Authorization: Bearer <ACTOR_TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"startAt":"2026-10-12T09:00:00+08:00","endAt":"2026-10-12T12:00:00+08:00","reason":"家中有事"}'
+# -> 201 {"unavailability":{"id":1,"actorId":2,
+#        "startAt":"2026-10-12T01:00:00.000Z","endAt":"2026-10-12T04:00:00.000Z",
+#        "reason":"家中有事",...}}
+#    若与本人当前参与的有效排练日程重叠 -> 409 整次拒绝并指出冲突日程：
+#    {"error":"UNAVAILABILITY_CONFLICT","message":"不可用时段与本人当前参与的有效排练日程重叠，本次操作未生效",
+#     "details":{"conflicts":[{"actorId":2,"actorName":"林晚",
+#        "schedule":{"id":1,"rehearsalId":1,"sceneId":1,"sceneTitle":"I 风暴前夜",
+#                    "startAt":"...","endAt":"..."},
+#        "unavailability":{"id":null,"startAt":"...","endAt":"...","reason":"家中有事"}}]}}
+#    已取消与待调整的日程不参与；端点相接（如 12:00 接 12:00）不算重叠。
+
+# 3. 查看本人不可用记录（仅演员本人；导演调用 403）
+curl -s http://localhost:3000/api/me/unavailability \
+  -H "Authorization: Bearer <ACTOR_TOKEN>"
+# -> {"unavailability":[{"id":1,"startAt":"...","endAt":"...","reason":"家中有事",...}]}
+
+# 4. 修改（可只改部分字段；改后与本人有效日程重叠同样 409 且原记录不变）
+curl -s -X PATCH http://localhost:3000/api/me/unavailability/1 \
+  -H "Authorization: Bearer <ACTOR_TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"endAt":"2026-10-12T13:00:00+08:00","reason":"家中有事（改）"}'
+
+# 5. 撤销
+curl -s -X DELETE http://localhost:3000/api/me/unavailability/1 \
+  -H "Authorization: Bearer <ACTOR_TOKEN>"
+# -> {"ok":true}
+
+# 6. 导演侧联动：安排/调整日程、派角/改派、显式换版时若撞上演员不可用时段，
+#    整次操作不生效，返回演员、日程及不可用时段（409 UNAVAILABILITY_CONFLICT）：
+curl -s -X POST http://localhost:3000/api/rehearsals/1/schedules \
+  -H "Authorization: Bearer <TOKEN>" -H 'Content-Type: application/json' \
+  -d '{"sceneId":1,"startAt":"2026-10-12T10:00:00+08:00","endAt":"2026-10-12T11:00:00+08:00"}'
+# -> 409 {"error":"UNAVAILABILITY_CONFLICT","message":"参与演员在该时段已登记不可用，本次安排未生效",
+#        "details":{"conflicts":[{"actorId":2,"actorName":"林晚",
+#          "schedule":{"id":null,"rehearsalId":1,"sceneId":1,"startAt":"...","endAt":"..."},
+#          "unavailability":{"id":1,"startAt":"...","endAt":"...","reason":"家中有事"}}]}}
+#    已有日程之间的互撞仍返回 409 SCHEDULE_CONFLICT，二者互不影响。
+```
+
 ## 测试
 
 端到端测试会用临时数据目录自动起停服务器，覆盖：认证与越权、修订原文校验、
 多种发布冲突与幂等合并、版本快照不可改写触发器、换版后按内容变化重确认、改派后原确认失效、
 日程时段校验与重叠冲突（含跨时区/端点相接/跨排练）、派角与换版的日程冲突回滚、待调整与已取消可见性、
 到场登记（开启冻结名单/缺口、签到幂等、改派换版调日程不回写、关闭记缺席、开放期取消作废与关闭后取消标注、
-导演/演员可见性）等：
+导演/演员可见性）、演员不可用时段（登记/修改/撤销与本人可见、UTC 归一化、端点相接、
+已取消与待调整不参与、与本人有效日程重叠整次拒绝、导演排期/调期/派角/换版撞不可用整次不生效、
+不改写已开启的到场登记）等：
 
 ```bash
 npm test
@@ -319,8 +390,9 @@ src/
   plays.js         剧本、场次、角色、台词、版本
   revisions.js     修订与发布（冲突检测核心）
   rehearsals.js    排练、派角、换版、逐场确认
-  schedules.js     排练日程（带时区时段、参与者/待补派、重叠冲突检测、取消联动登记）
+  schedules.js     排练日程（带时区时段、参与者/待补派、重叠冲突与不可用时段检测、取消联动登记）
   attendance.js    到场登记（开启冻结名单/缺口、本人签到、关闭记缺席、作废与统计）
+  unavailability.js 演员不可用时段（登记/修改/撤销/本人查看，与本人有效日程重叠即整次拒绝）
   server.js        Express 入口
 public/            原生 JS 单页前端
 scripts/           安装兜底脚本与端到端测试
